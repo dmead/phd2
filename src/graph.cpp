@@ -41,6 +41,7 @@
 #include <wx/dcbuffer.h>
 #include <wx/utils.h>
 #include <wx/colordlg.h>
+#include <wx/clipbrd.h>
 
 // clang-format off
 wxBEGIN_EVENT_TABLE(GraphLogWindow, wxWindow)
@@ -60,6 +61,9 @@ wxBEGIN_EVENT_TABLE(GraphLogWindow, wxWindow)
     EVT_BUTTON(BUTTON_GRAPH_CLEAR,GraphLogWindow::OnButtonClear)
     EVT_CHECKBOX(CHECKBOX_GRAPH_TRENDLINES,GraphLogWindow::OnCheckboxTrendlines)
     EVT_CHECKBOX(CHECKBOX_GRAPH_CORRECTIONS,GraphLogWindow::OnCheckboxCorrections)
+    EVT_MENU(GRAPH_CLEAR_SELECTION, GraphLogWindow::OnMenuClearSelection)
+    EVT_MENU(GRAPH_COPY_IMAGE, GraphLogWindow::OnMenuCopyImage)
+    EVT_MENU(GRAPH_SAVE_IMAGE, GraphLogWindow::OnMenuSaveImage)
 wxEND_EVENT_TABLE();
 // clang-format on
 
@@ -183,11 +187,19 @@ GraphLogWindow::GraphLogWindow(wxWindow *parent)
 
     wxStaticText *lbl;
 
-    lbl = new wxStaticText(this, wxID_ANY, _("RMS Error [px]:"), wxDefaultPosition, wxDefaultSize);
-    OSX_SMALL_FONT(lbl);
-    lbl->SetForegroundColour(*wxLIGHT_GREY);
-    lbl->SetBackgroundColour(*wxBLACK);
-    pButtonSizer->Add(lbl);
+    // the title switches to "Selection RMS" while a range is selected; size it for the longer label so the
+    // layout does not shift
+    wxSize titleSize(
+        std::max(GetTextExtent(_("RMS Error [px]:")).GetWidth(), GetTextExtent(_("Selection RMS [px]:")).GetWidth()), -1);
+    m_pClient->m_pRMSTitle =
+        new wxStaticText(this, wxID_ANY, _("RMS Error [px]:"), wxDefaultPosition, titleSize, wxST_NO_AUTORESIZE);
+    OSX_SMALL_FONT(m_pClient->m_pRMSTitle);
+    m_pClient->m_pRMSTitle->SetForegroundColour(*wxLIGHT_GREY);
+    m_pClient->m_pRMSTitle->SetBackgroundColour(*wxBLACK);
+    m_pClient->m_pRMSTitle->SetToolTip(_("Drag across the graph to show the stats and target for just that range. Click "
+                                         "the graph to clear the selection. Right-click the graph to copy or save an "
+                                         "image of the graph, stats and target."));
+    pButtonSizer->Add(m_pClient->m_pRMSTitle);
 
     wxSize size1 = GetTextExtent(_T("XXXX"));
 
@@ -261,6 +273,12 @@ const wxColor& GraphLogWindow::GetDecOrDyColor()
     return m_pClient->m_decOrDyColor;
 }
 
+const wxColor& GraphLogWindow::GetSelectionColor()
+{
+    static const wxColour s_color(90, 210, 130);
+    return s_color;
+}
+
 int GraphLogWindow::StringWidth(const wxString& string)
 {
     int width, height;
@@ -322,6 +340,10 @@ void GraphLogWindow::OnButtonSettings(wxCommandEvent& WXUNUSED(evt))
         menu->Append(GRAPH_RADX_COLOR, _("dx Color..."));
         menu->Append(GRAPH_DECDY_COLOR, _("dy Color..."));
     }
+    menu->AppendSeparator();
+
+    menu->Append(GRAPH_COPY_IMAGE, _("Copy Image to Clipboard"));
+    menu->Append(GRAPH_SAVE_IMAGE, _("Save Image..."));
 
     PopupMenu(menu, m_pSettingsButton->GetPosition().x,
               m_pSettingsButton->GetPosition().y + m_pSettingsButton->GetSize().GetHeight());
@@ -550,6 +572,10 @@ void GraphLogWindow::SetState(bool is_active)
         UpdateControls();
     }
     Show(is_active);
+
+    // the target only shows the graph selection while the graph is visible
+    if (m_pClient->m_hasSelection && pFrame && pFrame->pTarget)
+        pFrame->pTarget->Refresh();
 }
 
 void GraphLogWindow::EnableTrendLines(bool enable)
@@ -761,11 +787,16 @@ void GraphLogWindow::UpdateHeightButtonLabel()
 wxBEGIN_EVENT_TABLE(GraphLogClientWindow, wxWindow)
     EVT_PAINT(GraphLogClientWindow::OnPaint)
     EVT_LEFT_DOWN(GraphLogClientWindow::OnLeftBtnDown)
+    EVT_LEFT_UP(GraphLogClientWindow::OnLeftBtnUp)
+    EVT_MOTION(GraphLogClientWindow::OnMouseMove)
+    EVT_MOUSE_CAPTURE_LOST(GraphLogClientWindow::OnMouseCaptureLost)
+    EVT_CONTEXT_MENU(GraphLogClientWindow::OnContextMenu)
 wxEND_EVENT_TABLE();
 // clang-format on
 
 GraphLogClientWindow::GraphLogClientWindow(wxWindow *parent)
-    : wxWindow(parent, wxID_ANY, wxDefaultPosition, wxSize(401, 200), wxFULL_REPAINT_ON_RESIZE), m_line1(0), m_line2(0)
+    : wxWindow(parent, wxID_ANY, wxDefaultPosition, wxSize(401, 200), wxFULL_REPAINT_ON_RESIZE), m_line1(0), m_line2(0),
+      m_hasSelection(false), m_dragging(false), m_dragStartX(0)
 {
     SetBackgroundStyle(wxBG_STYLE_PAINT);
 
@@ -835,6 +866,12 @@ void GraphLogClientWindow::ResetData()
     m_noDitherRA.ClearAll();
     m_raSameSides = 0;
     m_ditherStarted = false;
+    if (m_hasSelection)
+    {
+        m_hasSelection = false;
+        if (pFrame && pFrame->pTarget)
+            pFrame->pTarget->Refresh();
+    }
     UpdateStats(0, 0);
     m_stats.ra_peak = m_stats.dec_peak = 0.0;
     m_stats.star_lost_cnt = 0;
@@ -1066,11 +1103,11 @@ void GraphLogClientWindow::AppendData(const GuideStepInfo& step)
     m_stats.dec_limit_cnt += (step.decLimited ? 1 : 0) - ((trend_items >= m_length && oldest.decLimited) ? 1 : 0);
 
     S_HISTORY cur(step);
+    cur.settling = m_ditherStarted || PhdController::IsSettling();
+    m_ditherStarted = false;
     m_history.push_front(cur);
 
-    if (m_ditherStarted)
-        m_ditherStarted = false;
-    else if (!PhdController::IsSettling())
+    if (!cur.settling)
     {
         long dt = ::wxGetUTCTimeMillis().GetValue() - m_timeBase;
         m_noDitherDec.AddGuideInfo(dt, cur.dec, cur.decDur);
@@ -1246,11 +1283,67 @@ enum
     GRAPH_BORDER = 5
 };
 
+static wxString duration_label(wxLongLong_t ms)
+{
+    long secs = (long) ((ms + 500) / 1000);
+    if (secs < 60)
+        return wxString::Format("%lds", secs);
+    if (secs < 3600)
+        return wxString::Format("%ldm %02lds", secs / 60, secs % 60);
+    return wxString::Format("%ldh %02ldm", secs / 3600, (secs / 60) % 60);
+}
+
+static void set_label_colour(wxStaticText *label, const wxColour& colour)
+{
+    if (label->GetForegroundColour() != colour)
+    {
+        label->SetForegroundColour(colour);
+        label->Refresh();
+    }
+}
+
 void GraphLogClientWindow::OnPaint(wxPaintEvent& WXUNUSED(evt))
 {
     wxAutoBufferedPaintDC dc(this);
 
-    wxSize size(GetClientSize());
+    double polarAlignCircleRadius = 0.0;
+    Render(dc, GetClientSize(), &polarAlignCircleRadius);
+
+    if (m_history.size() > 0)
+    {
+        // when drifting, center the polar align circle on the star; when adjusting, center the polar
+        // align circle at the lock position
+        const PHD_Point& center =
+            pFrame->pGuider->IsCalibratingOrGuiding() ? pFrame->pGuider->CurrentPosition() : pFrame->pGuider->LockPosition();
+        pFrame->pGuider->SetPolarAlignCircle(center, polarAlignCircleRadius);
+    }
+
+    // show the stats for the selected range when there is one, otherwise for the whole graph
+    SummaryStats selStats;
+    unsigned int selBegin, selEnd;
+    bool const haveSel = GetSelectionRange(&selBegin, &selEnd);
+    if (haveSel)
+        ComputeStats(selBegin, selEnd, &selStats);
+    const SummaryStats& stats = haveSel ? selStats : m_stats;
+
+    const double sampling = pFrame ? pFrame->GetCameraPixelScale() : 1.0;
+    const wxColour& statsColor = haveSel ? GraphLogWindow::GetSelectionColor() : *wxLIGHT_GREY;
+
+    set_label_colour(m_pRMSTitle, statsColor);
+    m_pRMSTitle->SetLabel(haveSel ? _("Selection RMS [px]:") : _("RMS Error [px]:"));
+    set_label_colour(m_pRaRMS, statsColor);
+    set_label_colour(m_pDecRMS, statsColor);
+    set_label_colour(m_pTotRMS, statsColor);
+    m_pRaRMS->SetLabel(rms_label(stats.rms_ra, sampling));
+    m_pDecRMS->SetLabel(rms_label(stats.rms_dec, sampling));
+    m_pTotRMS->SetLabel(rms_label(stats.rms_tot, sampling));
+
+    set_label_colour(m_pOscIndex, stats.osc_alert ? wxColour(185, 20, 0) : statsColor);
+    m_pOscIndex->SetLabel(wxString::Format("RA Osc: %4.2f", stats.osc_index));
+}
+
+void GraphLogClientWindow::Render(wxDC& dc, const wxSize& size, double *polarAlignCircleRadiusOut)
+{
     wxSize center(size.x / 2, size.y / 2);
 
     const int leftEdge = 0;
@@ -1276,6 +1369,27 @@ void GraphLogClientWindow::OnPaint(wxPaintEvent& WXUNUSED(evt))
 
     dc.SetBackground(*wxBLACK_BRUSH);
     dc.Clear();
+
+    const double xmag = size.x / (double) m_length;
+
+    // shade the selected range behind the grid and data
+    unsigned int selBegin, selEnd;
+    bool const haveSel = GetSelectionRange(&selBegin, &selEnd);
+    int selLeft = 0;
+    if (haveSel)
+    {
+        unsigned int const start_item = m_history.size() - GetItemCount();
+        selLeft = std::max(leftEdge, xorig + (int) (((double) (selBegin - start_item) - 0.5) * xmag));
+        int selRight = std::min(rightEdge, xorig + (int) (((double) (selEnd - 1 - start_item) + 0.5) * xmag));
+
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(wxColour(30, 58, 42)));
+        dc.DrawRectangle(selLeft, topEdge, selRight - selLeft + 1, bottomEdge - topEdge);
+        dc.SetBrush(*wxTRANSPARENT_BRUSH);
+        dc.SetPen(wxPen(GraphLogWindow::GetSelectionColor()));
+        dc.DrawLine(selLeft, topEdge, selLeft, bottomEdge);
+        dc.DrawLine(selRight, topEdge, selRight, bottomEdge);
+    }
 
     wxPen GreyDashPen(wxColour(200, 200, 200), 1, wxPENSTYLE_DOT);
 
@@ -1321,7 +1435,6 @@ void GraphLogClientWindow::OnPaint(wxPaintEvent& WXUNUSED(evt))
         dc.DrawLine(center.x + i * xPixelsPerDivision, topEdge, center.x + i * xPixelsPerDivision, bottomEdge);
     }
 
-    const double xmag = size.x / (double) m_length;
     const double ymag =
         yPixelsPerDivision * (double) (m_yDivisions + 1) / (double) m_height * (units == UNIT_ARCSEC ? sampling : 1.0);
 
@@ -1549,26 +1662,19 @@ void GraphLogClientWindow::OnPaint(wxPaintEvent& WXUNUSED(evt))
                 }
             }
         }
-        // when drifting, center the polar align circle on the star; when adjusting, center the polar
-        // align circle at the lock position
-        const PHD_Point& center =
-            pFrame->pGuider->IsCalibratingOrGuiding() ? pFrame->pGuider->CurrentPosition() : pFrame->pGuider->LockPosition();
-        pFrame->pGuider->SetPolarAlignCircle(center, polarAlignCircleRadius);
+        if (polarAlignCircleRadiusOut)
+            *polarAlignCircleRadiusOut = polarAlignCircleRadius;
+    }
 
-        m_pRaRMS->SetLabel(rms_label(m_stats.rms_ra, sampling));
-        m_pDecRMS->SetLabel(rms_label(m_stats.rms_dec, sampling));
-        m_pTotRMS->SetLabel(rms_label(m_stats.rms_tot, sampling));
-
-        if (m_stats.osc_alert)
-        {
-            m_pOscIndex->SetForegroundColour(wxColour(185, 20, 0));
-        }
-        else
-        {
-            m_pOscIndex->SetForegroundColour(*wxLIGHT_GREY);
-        }
-
-        m_pOscIndex->SetLabel(wxString::Format("RA Osc: %4.2f", m_stats.osc_index));
+    // label the selected range so a screenshot of the graph alone shows what was selected
+    if (haveSel)
+    {
+        wxString caption = RangeSummary(selBegin, selEnd);
+        dc.SetFont(SmallFont);
+        wxSize sz = dc.GetTextExtent(caption);
+        int x = std::max(leftEdge + 3, std::min(selLeft + 4, rightEdge - sz.GetWidth() - 4));
+        dc.SetTextForeground(GraphLogWindow::GetSelectionColor());
+        dc.DrawText(caption, x, bottomEdge - sz.GetHeight() - 3);
     }
 }
 
@@ -1628,12 +1734,371 @@ void GraphLogClientWindow::OnLeftBtnDown(wxMouseEvent& evt)
                         break;
                 }
                 RecalculateTrendLines();
-                Refresh();
+                SelectionChanged(); // removed frames may have been part of the selection
             }
         }
     }
+    else
+    {
+        // start selecting a range; the selection is replaced once the mouse is dragged
+        m_dragging = true;
+        m_dragStartX = evt.GetX();
+        CaptureMouse();
+    }
 
     evt.Skip();
+}
+
+// a click that moves less than this is a click, not a drag
+static const int MIN_DRAG_PIXELS = 3;
+
+void GraphLogClientWindow::OnMouseMove(wxMouseEvent& evt)
+{
+    if (m_dragging && abs(evt.GetX() - m_dragStartX) >= MIN_DRAG_PIXELS)
+    {
+        SelectFromPixels(m_dragStartX, evt.GetX());
+        SelectionChanged();
+    }
+
+    evt.Skip();
+}
+
+void GraphLogClientWindow::OnLeftBtnUp(wxMouseEvent& evt)
+{
+    if (m_dragging)
+    {
+        m_dragging = false;
+        if (HasCapture())
+            ReleaseMouse();
+
+        if (abs(evt.GetX() - m_dragStartX) >= MIN_DRAG_PIXELS)
+            SelectFromPixels(m_dragStartX, evt.GetX());
+        else
+            ClearSelection();
+        SelectionChanged();
+    }
+
+    evt.Skip();
+}
+
+void GraphLogClientWindow::OnMouseCaptureLost(wxMouseCaptureLostEvent& WXUNUSED(evt))
+{
+    m_dragging = false;
+}
+
+void GraphLogClientWindow::OnContextMenu(wxContextMenuEvent& WXUNUSED(evt))
+{
+    wxMenu menu;
+    menu.Append(GRAPH_CLEAR_SELECTION, _("Clear Selection"))->Enable(m_hasSelection);
+    menu.AppendSeparator();
+    menu.Append(GRAPH_COPY_IMAGE, _("Copy Image to Clipboard"));
+    menu.Append(GRAPH_SAVE_IMAGE, _("Save Image..."));
+    PopupMenu(&menu); // menu events propagate to GraphLogWindow
+}
+
+void GraphLogClientWindow::GetVisibleRange(unsigned int *begin, unsigned int *end) const
+{
+    *end = m_history.size();
+    *begin = *end - GetItemCount();
+}
+
+// index range [begin, end) of the visible history items that fall within the selection
+bool GraphLogClientWindow::GetSelectionRange(unsigned int *begin, unsigned int *end) const
+{
+    if (!m_hasSelection)
+        return false;
+
+    unsigned int b, e;
+    GetVisibleRange(&b, &e);
+    while (b < e && m_history[b].timestamp < m_selBegin)
+        ++b;
+    while (e > b && m_history[e - 1].timestamp > m_selEnd)
+        --e;
+    if (b == e)
+        return false;
+
+    *begin = b;
+    *end = e;
+    return true;
+}
+
+// compute the summary stats over history items [begin, end) the same way the running stats are computed:
+// RMS and peak exclude frames taken while dithering or settling
+void GraphLogClientWindow::ComputeStats(unsigned int begin, unsigned int end, SummaryStats *stats) const
+{
+    AxisStats raStats;
+    AxisStats decStats;
+    unsigned int raSameSides = 0;
+    stats->ra_limit_cnt = stats->dec_limit_cnt = 0;
+
+    for (unsigned int i = begin; i < end; i++)
+    {
+        const S_HISTORY& h = m_history[i];
+        if (!h.settling)
+        {
+            double dt = (double) (h.timestamp - m_timeBase);
+            raStats.AddGuideInfo(dt, h.ra, h.raDur);
+            decStats.AddGuideInfo(dt, h.dec, h.decDur);
+        }
+        if (i > begin && h.ra * m_history[i - 1].ra > 0.0)
+            ++raSameSides;
+        if (h.raLimited)
+            ++stats->ra_limit_cnt;
+        if (h.decLimited)
+            ++stats->dec_limit_cnt;
+    }
+
+    stats->nr = end - begin;
+    stats->rms_ra = raStats.GetPopulationSigma();
+    stats->rms_dec = decStats.GetPopulationSigma();
+    stats->rms_tot = hypot(stats->rms_ra, stats->rms_dec);
+    stats->ra_peak = std::max(fabs(raStats.GetMaxDisplacement()), fabs(raStats.GetMinDisplacement()));
+    stats->dec_peak = std::max(fabs(decStats.GetMaxDisplacement()), fabs(decStats.GetMinDisplacement()));
+
+    if (stats->nr >= 2)
+    {
+        stats->osc_index = 1.0 - (double) raSameSides / (double) (stats->nr - 1);
+        stats->osc_alert = stats->osc_index > 0.6 || stats->osc_index < 0.15;
+    }
+    else
+    {
+        stats->osc_index = 0.0;
+        stats->osc_alert = false;
+    }
+
+    stats->star_lost_cnt = 0; // not tracked per frame
+    stats->cur = m_history[end - 1];
+}
+
+wxString GraphLogClientWindow::RangeSummary(unsigned int begin, unsigned int end) const
+{
+    wxLongLong_t dt = m_history[end - 1].timestamp - m_history[begin].timestamp;
+    return wxString::Format(_("%u frames, %s"), end - begin, duration_label(dt));
+}
+
+void GraphLogClientWindow::SelectFromPixels(int x1, int x2)
+{
+    unsigned int begin, end;
+    GetVisibleRange(&begin, &end);
+    const int plot_length = end - begin;
+    const double xmag = GetClientSize().x / (double) m_length;
+
+    // nearest frame to each end of the dragged range, same mapping as Ctrl-click
+    int j1 = std::max(0, (int) floor(std::min(x1, x2) / xmag + 0.5));
+    int j2 = std::min(plot_length - 1, (int) floor(std::max(x1, x2) / xmag + 0.5));
+
+    if (j1 > j2)
+    {
+        ClearSelection();
+        return;
+    }
+
+    m_selBegin = m_history[begin + j1].timestamp;
+    m_selEnd = m_history[begin + j2].timestamp;
+    m_hasSelection = true;
+}
+
+void GraphLogClientWindow::ClearSelection()
+{
+    m_hasSelection = false;
+}
+
+void GraphLogClientWindow::SelectionChanged()
+{
+    Refresh();
+    if (pFrame && pFrame->pTarget)
+        pFrame->pTarget->Refresh();
+}
+
+void GraphLogWindow::OnMenuClearSelection(wxCommandEvent& WXUNUSED(evt))
+{
+    m_pClient->ClearSelection();
+    m_pClient->SelectionChanged();
+}
+
+bool GraphLogWindow::GetSelectedItems(std::vector<S_HISTORY> *items) const
+{
+    // a selection only applies while the graph showing it is visible
+    unsigned int begin, end;
+    if (!IsShown() || !m_pClient->GetSelectionRange(&begin, &end))
+        return false;
+
+    items->clear();
+    for (unsigned int i = begin; i < end; i++)
+        items->push_back(m_pClient->m_history[i]);
+    return true;
+}
+
+wxBitmap GraphLogWindow::CreateSnapshot()
+{
+    const GraphLogClientWindow *client = m_pClient;
+
+    unsigned int begin, end;
+    bool const haveSel = client->GetSelectionRange(&begin, &end);
+    if (!haveSel)
+        client->GetVisibleRange(&begin, &end);
+
+    SummaryStats selStats;
+    if (haveSel)
+        client->ComputeStats(begin, end, &selStats);
+    const SummaryStats& stats = haveSel ? selStats : client->m_stats;
+
+    const double sampling = pFrame ? pFrame->GetCameraPixelScale() : 1.0;
+    const int pad = 8;
+
+    // render the graph and target into their own bitmaps since each one clears its background
+
+    wxSize graphSize = m_pClient->GetClientSize();
+    graphSize.x = std::max(graphSize.x, 400);
+    graphSize.y = std::max(graphSize.y, 200);
+    wxBitmap graphBmp(graphSize.x, graphSize.y);
+    {
+        wxMemoryDC mdc(graphBmp);
+        m_pClient->Render(mdc, graphSize, nullptr);
+    }
+
+    const int targetSide = graphSize.y;
+    wxBitmap targetBmp(targetSide, targetSide);
+    {
+        wxMemoryDC mdc(targetBmp);
+        pFrame->pTarget->Render(mdc, wxSize(targetSide, targetSide));
+    }
+
+    // title: time span of the frames the stats cover
+
+    wxString title = _("PHD2 Guiding");
+    if (end > begin)
+    {
+        const S_HISTORY& h0 = client->m_history[begin];
+        const S_HISTORY& h1 = client->m_history[end - 1];
+        wxDateTime t0((time_t) (h0.timestamp / 1000));
+        wxDateTime t1((time_t) (h1.timestamp / 1000));
+        title += wxString::Format("   %s %s - %s", t0.FormatISODate(), t0.FormatISOTime(), t1.FormatISOTime());
+    }
+    wxString scale;
+    if (sampling != 1.0)
+        scale = wxString::Format(_("Pixel scale %.2f''/px"), sampling);
+
+    // stats panel, drawn as rows of label / value
+
+    bool const radec = client->m_mode == GraphLogClientWindow::MODE_RADEC;
+    const wxColour& raColor = radec ? client->m_raOrDxColor : *wxLIGHT_GREY;
+    const wxColour& decColor = radec ? client->m_decOrDyColor : *wxLIGHT_GREY;
+    const wxColour& selColor = GetSelectionColor();
+
+    struct Row
+    {
+        wxString label;
+        wxString value;
+        wxColour labelColor;
+        wxColour valueColor;
+    };
+    std::vector<Row> rows;
+    rows.push_back({ haveSel ? _("Selection") : _("Graph"), wxEmptyString, haveSel ? selColor : *wxWHITE, *wxLIGHT_GREY });
+    if (end > begin)
+        rows.push_back({ client->RangeSummary(begin, end), wxEmptyString, haveSel ? selColor : *wxLIGHT_GREY, *wxLIGHT_GREY });
+    rows.push_back({ wxEmptyString, wxEmptyString, *wxLIGHT_GREY, *wxLIGHT_GREY });
+    rows.push_back({ _("RMS Error [px]:"), wxEmptyString, *wxLIGHT_GREY, *wxLIGHT_GREY });
+    rows.push_back({ _("RA"), rms_label(stats.rms_ra, sampling), raColor, *wxWHITE });
+    rows.push_back({ _("Dec"), rms_label(stats.rms_dec, sampling), decColor, *wxWHITE });
+    rows.push_back({ _("Tot"), rms_label(stats.rms_tot, sampling), *wxLIGHT_GREY, *wxWHITE });
+    rows.push_back({ _("Peak [px]:"), wxEmptyString, *wxLIGHT_GREY, *wxLIGHT_GREY });
+    rows.push_back({ _("RA"), rms_label(stats.ra_peak, sampling), raColor, *wxWHITE });
+    rows.push_back({ _("Dec"), rms_label(stats.dec_peak, sampling), decColor, *wxWHITE });
+    rows.push_back({ _("RA Osc"), wxString::Format("%4.2f", stats.osc_index), *wxLIGHT_GREY,
+                     stats.osc_alert ? wxColour(185, 20, 0) : *wxWHITE });
+
+    wxFont font = GetFont();
+    wxFont boldFont = font.Bold();
+
+    // measure the text to size the image
+    int labelWidth = 0, valueWidth = 0, lineHeight = 0, wideRowWidth = 0;
+    for (const Row& row : rows)
+    {
+        int w, h;
+        GetTextExtent(row.label, &w, &h, nullptr, nullptr, &boldFont);
+        if (row.value.empty())
+            wideRowWidth = std::max(wideRowWidth, w);
+        else
+        {
+            labelWidth = std::max(labelWidth, w);
+            int vw;
+            GetTextExtent(row.value, &vw, &h, nullptr, nullptr, &font);
+            valueWidth = std::max(valueWidth, vw);
+        }
+        lineHeight = std::max(lineHeight, h);
+    }
+    lineHeight += 3;
+    const int panelWidth = std::max(labelWidth + pad + valueWidth, wideRowWidth) + 2 * pad;
+    const int titleHeight = lineHeight + 2 * pad;
+
+    wxBitmap bmp(panelWidth + graphSize.x + pad + targetSide + pad, titleHeight + graphSize.y + pad);
+    wxMemoryDC dc(bmp);
+    dc.SetBackground(*wxBLACK_BRUSH);
+    dc.Clear();
+
+    dc.SetFont(boldFont);
+    dc.SetTextForeground(*wxWHITE);
+    dc.DrawText(title, pad, pad);
+    if (!scale.empty())
+    {
+        dc.SetFont(font);
+        dc.SetTextForeground(*wxLIGHT_GREY);
+        dc.DrawText(scale, bmp.GetWidth() - pad - dc.GetTextExtent(scale).GetWidth(), pad);
+    }
+    dc.SetPen(*wxGREY_PEN);
+    dc.DrawLine(pad, titleHeight - pad / 2, bmp.GetWidth() - pad, titleHeight - pad / 2);
+
+    int y = titleHeight;
+    for (const Row& row : rows)
+    {
+        dc.SetFont(&row == &rows[0] ? boldFont : font);
+        dc.SetTextForeground(row.labelColor);
+        dc.DrawText(row.label, pad, y);
+        if (!row.value.empty())
+        {
+            dc.SetTextForeground(row.valueColor);
+            dc.DrawText(row.value, pad + labelWidth + pad, y);
+        }
+        y += lineHeight;
+    }
+
+    dc.DrawBitmap(graphBmp, panelWidth, titleHeight);
+    dc.DrawBitmap(targetBmp, panelWidth + graphSize.x + pad, titleHeight);
+    dc.SelectObject(wxNullBitmap);
+
+    return bmp;
+}
+
+void GraphLogWindow::OnMenuCopyImage(wxCommandEvent& WXUNUSED(evt))
+{
+    wxBitmap bmp = CreateSnapshot();
+
+    if (wxTheClipboard->Open())
+    {
+        wxTheClipboard->SetData(new wxBitmapDataObject(bmp));
+        wxTheClipboard->Close();
+        pFrame->StatusMsg(_("Graph image copied to the clipboard"));
+    }
+    else
+        pFrame->Alert(_("Could not open the clipboard"));
+}
+
+void GraphLogWindow::OnMenuSaveImage(wxCommandEvent& WXUNUSED(evt))
+{
+    // take the snapshot before the dialog opens so it shows the graph as it was when the menu item was chosen
+    wxBitmap bmp = CreateSnapshot();
+
+    wxFileDialog dlg(this, _("Save Graph Image"), Debug.GetLogDir(),
+                     wxDateTime::Now().Format(_T("PHD2_Graph_%Y-%m-%d_%H%M%S.png")), _("PNG files (*.png)|*.png"),
+                     wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    if (bmp.SaveFile(dlg.GetPath(), wxBITMAP_TYPE_PNG))
+        pFrame->StatusMsg(wxString::Format(_("Graph image saved to %s"), dlg.GetPath()));
+    else
+        pFrame->Alert(wxString::Format(_("Could not save graph image %s"), dlg.GetPath()));
 }
 
 GraphControlPane::GraphControlPane(wxWindow *pParent, const wxString& label) : wxWindow(pParent, wxID_ANY)

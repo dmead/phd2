@@ -36,6 +36,7 @@
 #define GRAPHCLASS
 
 #include <deque>
+#include <vector>
 #include "guiding_stats.h"
 
 class GraphControlPane;
@@ -69,12 +70,13 @@ struct S_HISTORY
     char decDir;
     bool raLimited;
     bool decLimited;
+    bool settling; // frame taken while dithering or settling, excluded from RMS stats
     S_HISTORY() { }
     S_HISTORY(const GuideStepInfo& step)
         : timestamp(::wxGetUTCTimeMillis().GetValue()), dx(step.cameraOffset.X), dy(step.cameraOffset.Y),
           ra(step.mountOffset.X), dec(step.mountOffset.Y), starSNR(step.starSNR), starMass(step.starMass),
           raDur(step.durationRA), decDur(step.durationDec), raDir(step.directionRA), decDir(step.directionDec),
-          raLimited(step.raLimited), decLimited(step.decLimited)
+          raLimited(step.raLimited), decLimited(step.decLimited), settling(false)
     {
     }
 };
@@ -116,7 +118,7 @@ private:
     static const int m_yDivisions = 3;
 
     wxColour m_raOrDxColor, m_decOrDyColor;
-    wxStaticText *m_pRaRMS, *m_pDecRMS, *m_pTotRMS, *m_pOscIndex;
+    wxStaticText *m_pRMSTitle, *m_pRaRMS, *m_pDecRMS, *m_pTotRMS, *m_pOscIndex;
 
     unsigned int m_minLength;
 
@@ -149,6 +151,13 @@ private:
     bool m_showStarMass;
     bool m_showStarSNR;
 
+    // range selection, anchored to the timestamps of the first and last selected frames
+    bool m_hasSelection;
+    wxLongLong_t m_selBegin;
+    wxLongLong_t m_selEnd;
+    bool m_dragging;
+    int m_dragStartX;
+
     friend class GraphLogWindow;
 
 public:
@@ -172,8 +181,22 @@ private:
     void RecalculateTrendLines();
     void UpdateStats(unsigned int nr, const S_HISTORY *cur);
 
+    void GetVisibleRange(unsigned int *begin, unsigned int *end) const;
+    bool GetSelectionRange(unsigned int *begin, unsigned int *end) const;
+    void ComputeStats(unsigned int begin, unsigned int end, SummaryStats *stats) const;
+    wxString RangeSummary(unsigned int begin, unsigned int end) const;
+    void SelectFromPixels(int x1, int x2);
+    void ClearSelection();
+    void SelectionChanged();
+
+    void Render(wxDC& dc, const wxSize& size, double *polarAlignCircleRadiusOut);
+
     void OnPaint(wxPaintEvent& evt);
     void OnLeftBtnDown(wxMouseEvent& evt);
+    void OnLeftBtnUp(wxMouseEvent& evt);
+    void OnMouseMove(wxMouseEvent& evt);
+    void OnMouseCaptureLost(wxMouseCaptureLostEvent& evt);
+    void OnContextMenu(wxContextMenuEvent& evt);
 
     wxDECLARE_EVENT_TABLE();
 };
@@ -254,14 +277,23 @@ public:
     void OnCheckboxCorrections(wxCommandEvent& evt);
     void OnButtonZoomIn(wxCommandEvent& evt);
     void OnButtonZoomOut(wxCommandEvent& evt);
+    void OnMenuClearSelection(wxCommandEvent& evt);
+    void OnMenuCopyImage(wxCommandEvent& evt);
+    void OnMenuSaveImage(wxCommandEvent& evt);
 
     wxStaticText *m_pLabel1, *m_pLabel2;
 
     const wxColor& GetRaOrDxColor();
     const wxColor& GetDecOrDyColor();
+    static const wxColor& GetSelectionColor();
 
     const SummaryStats& Stats() const { return m_pClient->m_stats; }
     void ResetData();
+
+    // history items in the range selected on the graph, oldest first; returns false when nothing is selected
+    bool GetSelectedItems(std::vector<S_HISTORY> *items) const;
+    // composite image of the graph, its stats and the target, for sharing
+    wxBitmap CreateSnapshot();
 
     wxDECLARE_EVENT_TABLE();
 };

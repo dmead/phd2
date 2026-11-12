@@ -61,6 +61,7 @@ class TargetClient : public wxWindow
 
     void AppendData(const GuideStepInfo& step);
 
+    void Render(wxDC& dc, const wxSize& size);
     void OnPaint(wxPaintEvent& evt);
 
     friend class TargetWindow;
@@ -84,6 +85,7 @@ public:
     void SetState(bool is_active);
     void UpdateControls(void);
     void OnButtonClear(wxCommandEvent& evt);
+    void Render(wxDC& dc, const wxSize& size) { m_pClient->Render(dc, size); }
 
 private:
     void OnButtonLength(wxCommandEvent& evt);

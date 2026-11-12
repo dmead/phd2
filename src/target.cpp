@@ -267,7 +267,11 @@ void TargetClient::AppendData(const GuideStepInfo& step)
 void TargetClient::OnPaint(wxPaintEvent& WXUNUSED(evt))
 {
     wxAutoBufferedPaintDC dc(this);
+    Render(dc, GetClientSize());
+}
 
+void TargetClient::Render(wxDC& dc, const wxSize& size)
+{
     dc.SetBackground(*wxBLACK_BRUSH);
     // dc.SetBackground(wxColour(10,0,0));
     dc.Clear();
@@ -281,7 +285,6 @@ void TargetClient::OnPaint(wxPaintEvent& WXUNUSED(evt))
     dc.SetPen(GreySolidPen);
     dc.SetBrush(*wxTRANSPARENT_BRUSH);
 
-    wxSize size = GetClientSize();
     wxPoint center(size.x / 2, size.y / 2);
     int radius_max = ((size.x < size.y ? size.x : size.y) - 6) / 2;
 
@@ -374,6 +377,23 @@ void TargetClient::OnPaint(wxPaintEvent& WXUNUSED(evt))
         dc.DrawText(_("SkyN"), center.x + 5, center.y + 5 + radius_max); // sky N = mount S
 
     dc.SetPen(wxPen(wxColour(127, 127, 255), 1, wxPENSTYLE_SOLID));
+
+    // when a range is selected on the guide graph, show only the frames in that range
+    std::vector<S_HISTORY> selection;
+    if (pFrame && pFrame->pGraphLog && pFrame->pGraphLog->GetSelectedItems(&selection))
+    {
+        for (const S_HISTORY& h : selection)
+        {
+            int ximpact = center.x + h.ra * scale * m_zoom * raSign;
+            int yimpact = center.y - h.dec * scale * m_zoom * decSign;
+            dc.DrawCircle(ximpact, yimpact, 1);
+        }
+
+        dc.SetTextForeground(GraphLogWindow::GetSelectionColor());
+        dc.DrawText(wxString::Format(_("Selection: %u frames"), (unsigned int) selection.size()), 3, 3);
+        return;
+    }
+
     for (unsigned int i = startPoint; i < m_maxHistorySize; i++)
     {
         int ximpact = center.x + m_history[i].ra * scale * m_zoom * raSign;
